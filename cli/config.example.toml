@@ -1,0 +1,111 @@
+# Antigravity Proxy CLI Configuration
+# Copy this to ~/.config/antigravity-proxy/config.toml
+
+[server]
+port = 8045
+host = "127.0.0.1"
+allow_lan_access = false
+
+[auth]
+mode = "off"  # off | strict | all_except_health
+# api_key = "sk-your-key-here"  # Required when mode != off
+
+[accounts]
+# Directory where GUI accounts are stored
+directory = "~/.antigravity_tools/accounts"
+
+[timeouts]
+request_timeout = 120
+
+# =============================================================================
+# Model Mapping Configuration
+# =============================================================================
+# Format: "input_model" = "target_model"
+# 
+# Mapping priority:
+# 1. custom > openai > anthropic
+# 2. If no mapping found, gemini-* models pass through, others fallback to gemini-2.5-flash
+
+# --- OpenAI Models → Gemini ---
+[model_mapping.openai]
+# GPT-4 系列 → gemini-2.5-pro
+"gpt-4" = "gemini-2.5-pro"
+"gpt-4-turbo" = "gemini-2.5-pro"
+"gpt-4-turbo-preview" = "gemini-2.5-pro"
+"gpt-4-0125-preview" = "gemini-2.5-pro"
+"gpt-4-1106-preview" = "gemini-2.5-pro"
+"gpt-4-0613" = "gemini-2.5-pro"
+
+# GPT-4o 系列 → gemini-2.5-pro
+"gpt-4o" = "gemini-2.5-pro"
+"gpt-4o-2024-05-13" = "gemini-2.5-pro"
+"gpt-4o-2024-08-06" = "gemini-2.5-pro"
+
+# GPT-4o-mini → gemini-2.5-flash
+"gpt-4o-mini" = "gemini-2.5-flash"
+"gpt-4o-mini-2024-07-18" = "gemini-2.5-flash"
+
+# GPT-3.5 系列 → gemini-2.5-flash
+"gpt-3.5-turbo" = "gemini-2.5-flash"
+"gpt-3.5-turbo-16k" = "gemini-2.5-flash"
+"gpt-3.5-turbo-0125" = "gemini-2.5-flash"
+"gpt-3.5-turbo-1106" = "gemini-2.5-flash"
+"gpt-3.5-turbo-0613" = "gemini-2.5-flash"
+
+# o1/o3 reasoning models → gemini-2.5-pro
+"o1" = "gemini-2.5-pro"
+"o1-preview" = "gemini-2.5-pro"
+"o1-mini" = "gemini-2.5-flash"
+"o3" = "gemini-2.5-pro"
+"o3-mini" = "gemini-2.5-flash"
+
+# --- Claude Models → Gemini/Claude (Cloud Code internal) ---
+[model_mapping.anthropic]
+# Claude 4.5 系列 (直通到 Cloud Code 支持的模型)
+"claude-opus-4-5-thinking" = "claude-opus-4-5-thinking"
+"claude-sonnet-4-5" = "claude-sonnet-4-5"
+"claude-sonnet-4-5-thinking" = "claude-sonnet-4-5-thinking"
+
+# Claude 3.5 别名 → Claude 4.5
+"claude-3-5-sonnet-20241022" = "claude-sonnet-4-5"
+"claude-3-5-sonnet-20240620" = "claude-sonnet-4-5"
+"claude-sonnet-4-5-20250929" = "claude-sonnet-4-5-thinking"
+
+# Claude Opus 别名
+"claude-opus-4" = "claude-opus-4-5-thinking"
+"claude-opus-4-5-20251101" = "claude-opus-4-5-thinking"
+"claude-3-opus-20240229" = "claude-opus-4-5-thinking"
+
+# Claude Haiku → 降级到轻量模型
+"claude-haiku-4" = "gemini-2.5-flash-lite"
+"claude-3-haiku-20240307" = "gemini-2.5-flash-lite"
+"claude-haiku-4-5-20251001" = "gemini-2.5-flash-lite"
+
+# Claude 3 Sonnet
+"claude-3-sonnet-20240229" = "claude-sonnet-4-5"
+
+# --- Custom/Special Models ---
+[model_mapping.custom]
+# Gemini 系列 (直通)
+"gemini-2.5-flash" = "gemini-2.5-flash"
+"gemini-2.5-flash-lite" = "gemini-2.5-flash-lite"
+"gemini-2.5-flash-thinking" = "gemini-2.5-flash-thinking"
+"gemini-2.5-pro" = "gemini-2.5-pro"
+"gemini-3-flash" = "gemini-3-flash"
+"gemini-3-pro-low" = "gemini-3-pro-low"
+"gemini-3-pro-high" = "gemini-3-pro-high"
+"gemini-3-pro-image" = "gemini-3-pro-image"
+
+# Legacy Gemini
+"gemini-1.5-pro" = "gemini-2.5-pro"
+"gemini-1.5-pro-002" = "gemini-2.5-pro"
+"gemini-1.5-flash" = "gemini-2.5-flash"
+"gemini-1.5-flash-002" = "gemini-2.5-flash"
+"gemini-2.0-flash-exp" = "gemini-2.5-flash"
+
+[logging]
+level = "info"
+
+[scheduling]
+mode = "balance"  # performance_first | balance | cache_first
+max_wait_seconds = 30

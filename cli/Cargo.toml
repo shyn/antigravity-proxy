@@ -1,0 +1,38 @@
+[package]
+name = "antigravity-proxy"
+version = "0.1.0"
+edition = "2021"
+description = "CLI API proxy for Antigravity - routes OpenAI/Claude requests to Google Gemini"
+authors = ["Antigravity Contributors"]
+license = "CC-BY-NC-SA-4.0"
+
+[[bin]]
+name = "antigravity-proxy"
+path = "src/main.rs"
+
+[dependencies]
+antigravity-core = { path = "../core" }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Server/Runtime (needed for main)
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7" }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Data
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Utilities
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1.0"
+thiserror = "2"
+rand = "0.9.2"
