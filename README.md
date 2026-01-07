@@ -1,5 +1,11 @@
 # Antigravity Proxy
 
+> [!WARNING]
+> **免责声明 (Disclaimer)**: 
+> 本项目是基于逆向工程开发的。我们不保证使用本项目不会导致您的账号被封禁，也不保证本项目在未来能持续正常工作。请在遵守相关服务条款的前提下谨慎使用。
+> 
+> This project is developed based on reverse engineering. We do not guarantee that using this project will not result in your account being banned, nor do we guarantee that this project will continue to function in the future. Please use with caution and in compliance with the relevant terms of service.
+
 Antigravity Proxy is a high-performance Rust-based proxy server designed for API mapping, authentication, and client communication. It consists of a core library and a command-line interface (CLI).
 
 ## Features
@@ -27,7 +33,7 @@ Antigravity Proxy is a high-performance Rust-based proxy server designed for API
 Clone the repository and build the project:
 
 ```bash
-git clone https://github.com/your-repo/antigravity-proxy.git
+git clone https://github.com/shyn/antigravity-proxy.git
 cd antigravity-proxy
 cargo build --release
 ```
