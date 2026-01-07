@@ -170,6 +170,7 @@ pub async fn handle_messages(
     let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size).max(1);
 
     let mut last_error = String::new();
+    let mut last_status: Option<u16> = None;
     let mut request_for_body = request.clone();
     
     for attempt in 0..max_attempts {
@@ -323,6 +324,7 @@ pub async fn handle_messages(
         let status_code = status.as_u16();
         let error_text = response.text().await.unwrap_or_else(|_| format!("HTTP {}", status));
         last_error = format!("HTTP {}: {}", status_code, error_text);
+        last_status = Some(status_code);
         
         debug!("[{}] Upstream error: {}", trace_id, last_error);
         
@@ -340,13 +342,28 @@ pub async fn handle_messages(
         }
     }
     
-    // 所有重试失败
+    // 所有重试失败 - 保留原始状态码
+    let response_status = match last_status {
+        Some(429) => StatusCode::TOO_MANY_REQUESTS,
+        Some(code) if code >= 400 && code < 600 => {
+            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY)
+        }
+        _ => StatusCode::BAD_GATEWAY,
+    };
+
+    // 对于 429，使用 rate_limit_error 类型增加语义
+    let error_type = if last_status == Some(429) {
+        "rate_limit_error"
+    } else {
+        "api_error"
+    };
+
     (
-        StatusCode::BAD_GATEWAY,
+        response_status,
         Json(json!({
             "type": "error",
             "error": {
-                "type": "api_error",
+                "type": error_type,
                 "message": last_error
             }
         }))

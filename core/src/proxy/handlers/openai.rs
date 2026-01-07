@@ -334,8 +334,10 @@ pub async fn handle_images_generations(
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
     
     if !response.status().is_success() {
+        let status_code = response.status().as_u16();
         let error_text = response.text().await.unwrap_or_default();
-        return Err((StatusCode::BAD_GATEWAY, error_text));
+        let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+        return Err((status, error_text));
     }
     
     let raw_response: Value = response.json().await
