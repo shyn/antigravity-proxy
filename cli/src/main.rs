@@ -19,8 +19,8 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     
     match cli.command {
-        Commands::Start { config, port } => {
-            cli::commands::start::run(config, port).await?;
+        Commands::Start { port } => {
+            cli::commands::start::run(cli.config, port).await?;
         }
         Commands::Accounts { command } => {
             cli::commands::accounts::run(command).await?;

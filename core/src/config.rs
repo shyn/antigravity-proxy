@@ -200,17 +200,53 @@ pub fn default_config_path() -> PathBuf {
         .join("config.toml")
 }
 
-/// Load config from file, or return defaults if not found
+/// Load config from file, or return defaults if not found.
+/// 
+/// Loading order:
+/// 1. Specified path (if provided)
+/// 2. ./config.toml (if exists)
+/// 3. default_config_path() (usually ~/.config/antigravity-proxy/config.toml)
 pub fn load_config(path: Option<PathBuf>) -> anyhow::Result<Config> {
-    let config_path = path.unwrap_or_else(default_config_path);
-    
-    if config_path.exists() {
-        let content = std::fs::read_to_string(&config_path)?;
+    if let Some(config_path) = path {
+        if config_path.exists() {
+            let content = std::fs::read_to_string(&config_path)?;
+            let config: Config = toml::from_str(&content)?;
+            tracing::info!("Loaded config from specified path {:?}", config_path);
+            return Ok(config);
+        } else {
+            anyhow::bail!("Specified config file not found: {:?}", config_path);
+        }
+    }
+
+    // Try current directory config.toml
+    let local_config = PathBuf::from("config.toml");
+    if local_config.exists() {
+        match std::fs::read_to_string(&local_config) {
+            Ok(content) => {
+                match toml::from_str::<Config>(&content) {
+                    Ok(config) => {
+                        tracing::info!("Loaded config from current directory {:?}", local_config);
+                        return Ok(config);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to parse ./config.toml: {}. Falling back to default path.", e);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to read ./config.toml: {}. Falling back to default path.", e);
+            }
+        }
+    }
+
+    let default_path = default_config_path();
+    if default_path.exists() {
+        let content = std::fs::read_to_string(&default_path)?;
         let config: Config = toml::from_str(&content)?;
-        tracing::info!("Loaded config from {:?}", config_path);
+        tracing::info!("Loaded config from default path {:?}", default_path);
         Ok(config)
     } else {
-        tracing::info!("Config file not found, using defaults");
+        tracing::info!("No config file found, using defaults");
         Ok(Config::default())
     }
 }
