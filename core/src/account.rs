@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-const DATA_DIR: &str = ".antigravity_tools";
+const DATA_DIR: &str = ".antigravity-proxy";
 const ACCOUNTS_DIR: &str = "accounts";
 
 /// Token data structure

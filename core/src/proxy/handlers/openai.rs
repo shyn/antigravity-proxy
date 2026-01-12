@@ -10,6 +10,8 @@ use serde_json::{json, Value};
 
 use crate::proxy::server::AppState;
 
+const MAX_RETRY_ATTEMPTS: usize = 3;
+
 /// Handle POST /v1/chat/completions
 pub async fn handle_chat_completions(
     State(state): State<AppState>,
@@ -27,53 +29,100 @@ pub async fn handle_chat_completions(
     // Resolve model mapping
     let gemini_model = resolve_model(&state, model).await;
     
-    // Get token
-    let session_id = None; // TODO: extract from headers
-    let (access_token, project_id, email) = state.token_manager
-        .get_token("text", false, session_id)
-        .await
-        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+    let token_manager = &state.token_manager;
+    let pool_size = token_manager.len();
+    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size).max(1);
     
-    tracing::info!("OpenAI request: {} -> {} (account: {})", model, gemini_model, email);
+    let mut last_error = String::new();
+    let mut last_status: Option<u16> = None;
     
-    // Build v1internal request
-    let v1_request = build_v1internal_request(&body, &gemini_model, &project_id)?;
-    
-    // Call upstream
-    let client = crate::proxy::upstream::client::UpstreamClient::new(None);
-    
-    let method = if stream { "streamGenerateContent" } else { "generateContent" };
-    let query = if stream { Some("alt=sse") } else { None };
-    
-    let response = client
-        .call_v1_internal(method, &access_token, v1_request, query)
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
-    
-    let status = response.status();
-    
-    if !status.is_success() {
-        let error_text = response.text().await.unwrap_or_default();
-        tracing::error!("Upstream error {}: {}", status, error_text);
-        return Err((StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY), error_text));
+    for attempt in 0..max_attempts {
+        let force_rotate = attempt > 0;
+        
+        // Get token
+        let session_id = None; // TODO: extract from headers
+        let (access_token, project_id, email) = match token_manager
+            .get_token("text", force_rotate, session_id)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                return Err((StatusCode::SERVICE_UNAVAILABLE, e.to_string()));
+            }
+        };
+        
+        tracing::info!("OpenAI request: {} -> {} (account: {}, attempt: {})", model, gemini_model, email, attempt + 1);
+        
+        // Build v1internal request
+        let v1_request = build_v1internal_request(&body, &gemini_model, &project_id)?;
+        
+        // Call upstream
+        let client = crate::proxy::upstream::client::UpstreamClient::new(None);
+        
+        let method = if stream { "streamGenerateContent" } else { "generateContent" };
+        let query = if stream { Some("alt=sse") } else { None };
+        
+        let response = match client
+            .call_v1_internal(method, &access_token, v1_request, query, false)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_error = e.clone();
+                
+                // Parse status code from error and mark account as rate-limited
+                let status_code = if e.contains("429") { 
+                    429u16 
+                } else if e.contains("503") { 
+                    503u16 
+                } else if e.contains("500") { 
+                    500u16 
+                } else { 
+                    502u16 
+                };
+                last_status = Some(status_code);
+                
+                // Mark account as rate limited so next get_token() returns a different account
+                if status_code == 429 || status_code == 503 || status_code == 500 {
+                    token_manager.mark_rate_limited(
+                        &email,
+                        status_code,
+                        None,
+                        &e,
+                    );
+                    tracing::info!("OpenAI: Account {} marked as rate-limited (status {})", email, status_code);
+                }
+                
+                continue;
+            }
+        };
+        
+        // Success
+        if stream {
+            // TODO: Implement SSE streaming conversion
+            let body_text = response.text().await.unwrap_or_default();
+            return Ok((StatusCode::OK, body_text).into_response());
+        } else {
+            let raw_response: Value = response.json().await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Invalid JSON response: {}", e)))?;
+            
+            // Extract response from v1internal wrapper
+            let gemini_response = raw_response.get("response").unwrap_or(&raw_response);
+            
+            // Convert Gemini response to OpenAI format
+            let openai_response = crate::proxy::mappers::gemini_to_openai::convert_chat_response(gemini_response, model);
+            
+            return Ok(Json(openai_response).into_response());
+        }
     }
     
-    if stream {
-        // TODO: Implement SSE streaming conversion
-        let body_text = response.text().await.unwrap_or_default();
-        Ok((StatusCode::OK, body_text).into_response())
-    } else {
-        let raw_response: Value = response.json().await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Invalid JSON response: {}", e)))?;
-        
-        // Extract response from v1internal wrapper
-        let gemini_response = raw_response.get("response").unwrap_or(&raw_response);
-        
-        // Convert Gemini response to OpenAI format
-        let openai_response = crate::proxy::mappers::gemini_to_openai::convert_chat_response(gemini_response, model);
-        
-        Ok(Json(openai_response).into_response())
-    }
+    // All retries failed
+    let response_status = match last_status {
+        Some(429) => StatusCode::TOO_MANY_REQUESTS,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    
+    Err((response_status, last_error))
 }
 
 /// Build v1internal request wrapper
@@ -168,9 +217,60 @@ fn build_v1internal_request(body: &Value, gemini_model: &str, project_id: &str) 
         gen_config["stopSequences"] = stop.clone();
     }
     
+    // [FIX] Antigravity 身份注入 (matches TypeScript implementation)
+    // Only inject for non-image generation models
+    let is_image_model = gemini_model.contains("image");
+    if !is_image_model {
+        const ANTIGRAVITY_IDENTITY: &str = r#"You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.
+You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.
+**Absolute paths only**
+**Proactiveness**"#;
+
+        // Check if user already provided Antigravity identity
+        let user_has_antigravity = system_instruction
+            .as_ref()
+            .and_then(|si| si.get("parts"))
+            .and_then(|parts| parts.as_array())
+            .map(|parts| {
+                parts.iter().any(|p| {
+                    p.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t.contains("You are Antigravity"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+
+        if !user_has_antigravity {
+            if let Some(ref mut sys_inst) = system_instruction {
+                // Prepend identity to existing system instruction
+                if let Some(parts) = sys_inst.get_mut("parts").and_then(|p| p.as_array_mut()) {
+                    parts.insert(0, json!({"text": ANTIGRAVITY_IDENTITY}));
+                    tracing::debug!("[Identity] Injected Antigravity identity at beginning of existing systemInstruction");
+                }
+            } else {
+                // Create new system instruction with identity
+                system_instruction = Some(json!({
+                    "parts": [{"text": ANTIGRAVITY_IDENTITY}]
+                }));
+                tracing::debug!("[Identity] Created new systemInstruction with Antigravity identity");
+            }
+        }
+    }
+    
+    // Generate session ID (matches TypeScript: `alma-${Date.now()}-${random}`)
+    let session_id = format!("alma-{}-{}", 
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        uuid::Uuid::new_v4().simple().to_string().chars().take(8).collect::<String>()
+    );
+    
     // Build inner request
     let mut inner_request = json!({
         "contents": contents,
+        "sessionId": session_id,
         "safetySettings": [
             { "category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF" },
             { "category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF" },
@@ -180,7 +280,9 @@ fn build_v1internal_request(body: &Value, gemini_model: &str, project_id: &str) 
         ]
     });
     
-    if let Some(sys_inst) = system_instruction {
+    // Add systemInstruction with role: 'user' (required by Antigravity API)
+    if let Some(mut sys_inst) = system_instruction {
+        sys_inst["role"] = json!("user");
         inner_request["systemInstruction"] = sys_inst;
     }
     
@@ -188,17 +290,17 @@ fn build_v1internal_request(body: &Value, gemini_model: &str, project_id: &str) 
         inner_request["generationConfig"] = gen_config;
     }
     
-    // Generate request ID
-    let request_id = format!("cli-{}", uuid::Uuid::new_v4().simple());
+    // Generate request ID (matches TypeScript: `alma-${crypto.randomUUID()}`)
+    let request_id = format!("alma-{}", uuid::Uuid::new_v4());
     
-    // Build v1internal wrapper
+    // Build v1internal wrapper (matches TypeScript AntigravityRequestBody)
     let v1_body = json!({
         "project": project_id,
-        "requestId": request_id,
-        "request": inner_request,
         "model": gemini_model,
-        "userAgent": "antigravity-cli",
-        "requestType": "text"
+        "request": inner_request,
+        "userAgent": "antigravity",
+        "requestId": request_id,
+        "requestType": "agent"
     });
     
     Ok(v1_body)
@@ -293,81 +395,121 @@ pub async fn handle_images_generations(
         .and_then(|v| v.as_str())
         .ok_or((StatusCode::BAD_REQUEST, "Missing prompt".to_string()))?;
     
-    // Get token for image generation
-    let (access_token, project_id, email) = state.token_manager
-        .get_token("image_gen", false, None)
-        .await
-        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+    let token_manager = &state.token_manager;
+    let pool_size = token_manager.len();
+    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size).max(1);
     
-    tracing::info!("Image generation request (account: {})", email);
+    let mut last_error = String::new();
+    let mut last_status: Option<u16> = None;
     
-    // Build v1internal request for image generation
-    let inner_request = json!({
-        "contents": [{
-            "role": "user",
-            "parts": [{"text": prompt}]
-        }],
-        "generationConfig": {
-            "imageConfig": {
-                "numberOfImages": body.get("n").and_then(|v| v.as_i64()).unwrap_or(1),
-                "outputMimeType": "image/png"
+    for attempt in 0..max_attempts {
+        let force_rotate = attempt > 0;
+        
+        // Get token for image generation
+        let (access_token, project_id, email) = match token_manager
+            .get_token("image_gen", force_rotate, None)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                return Err((StatusCode::SERVICE_UNAVAILABLE, e.to_string()));
             }
-        }
-    });
-    
-    let request_id = format!("cli-img-{}", uuid::Uuid::new_v4().simple());
-    
-    let v1_body = json!({
-        "project": project_id,
-        "requestId": request_id,
-        "request": inner_request,
-        "model": "gemini-3-pro-image",
-        "userAgent": "antigravity-cli",
-        "requestType": "image_gen"
-    });
-    
-    let client = crate::proxy::upstream::client::UpstreamClient::new(None);
-    
-    let response = client
-        .call_v1_internal("generateContent", &access_token, v1_body, None)
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
-    
-    if !response.status().is_success() {
-        let status_code = response.status().as_u16();
-        let error_text = response.text().await.unwrap_or_default();
-        let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
-        return Err((status, error_text));
-    }
-    
-    let raw_response: Value = response.json().await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Invalid JSON: {}", e)))?;
-    
-    let gemini_response = raw_response.get("response").unwrap_or(&raw_response);
-    
-    // Extract images from response
-    let images: Vec<Value> = gemini_response.get("candidates")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("content"))
-        .and_then(|c| c.get("parts"))
-        .and_then(|p| p.as_array())
-        .map(|parts| {
-            parts.iter()
-                .filter_map(|part| {
-                    part.get("inlineData").map(|data| {
-                        json!({
-                            "b64_json": data.get("data").and_then(|v| v.as_str()).unwrap_or("")
+        };
+        
+        tracing::info!("Image generation request (account: {}, attempt: {})", email, attempt + 1);
+        
+        // Build v1internal request for image generation
+        let inner_request = json!({
+            "contents": [{
+                "role": "user",
+                "parts": [{"text": prompt}]
+            }],
+            "generationConfig": {
+                "imageConfig": {
+                    "numberOfImages": body.get("n").and_then(|v| v.as_i64()).unwrap_or(1),
+                    "outputMimeType": "image/png"
+                }
+            }
+        });
+        
+        let request_id = format!("cli-img-{}", uuid::Uuid::new_v4().simple());
+        
+        let v1_body = json!({
+            "project": project_id,
+            "requestId": request_id,
+            "request": inner_request,
+            "model": "gemini-3-pro-image",
+            "userAgent": "antigravity-cli",
+            "requestType": "image_gen"
+        });
+        
+        let client = crate::proxy::upstream::client::UpstreamClient::new(None);
+        
+        let response = match client
+            .call_v1_internal("generateContent", &access_token, v1_body, None, false)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_error = e.clone();
+                
+                let status_code = if e.contains("429") { 
+                    429u16 
+                } else if e.contains("503") { 
+                    503u16 
+                } else if e.contains("500") { 
+                    500u16 
+                } else { 
+                    502u16 
+                };
+                last_status = Some(status_code);
+                
+                if status_code == 429 || status_code == 503 || status_code == 500 {
+                    token_manager.mark_rate_limited(&email, status_code, None, &e);
+                    tracing::info!("Image: Account {} marked as rate-limited (status {})", email, status_code);
+                }
+                
+                continue;
+            }
+        };
+        
+        let raw_response: Value = response.json().await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Invalid JSON: {}", e)))?;
+        
+        let gemini_response = raw_response.get("response").unwrap_or(&raw_response);
+        
+        // Extract images from response
+        let images: Vec<Value> = gemini_response.get("candidates")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("content"))
+            .and_then(|c| c.get("parts"))
+            .and_then(|p| p.as_array())
+            .map(|parts| {
+                parts.iter()
+                    .filter_map(|part| {
+                        part.get("inlineData").map(|data| {
+                            json!({
+                                "b64_json": data.get("data").and_then(|v| v.as_str()).unwrap_or("")
+                            })
                         })
                     })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+                    .collect()
+            })
+            .unwrap_or_default();
+        
+        return Ok(Json(json!({
+            "created": chrono::Utc::now().timestamp(),
+            "data": images
+        })));
+    }
     
-    Ok(Json(json!({
-        "created": chrono::Utc::now().timestamp(),
-        "data": images
-    })))
+    // All retries failed
+    let response_status = match last_status {
+        Some(429) => StatusCode::TOO_MANY_REQUESTS,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    
+    Err((response_status, last_error))
 }
 
 /// Resolve model mapping

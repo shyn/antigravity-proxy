@@ -171,7 +171,7 @@ pub async fn handle_messages(
 
     let mut last_error = String::new();
     let mut last_status: Option<u16> = None;
-    let mut request_for_body = request.clone();
+    let request_for_body = request.clone();
     
     for attempt in 0..max_attempts {
         // 模型路由
@@ -252,102 +252,114 @@ pub async fn handle_messages(
         let is_stream = request.stream;
         let method = if is_stream { "streamGenerateContent" } else { "generateContent" };
         let query = if is_stream { Some("alt=sse") } else { None };
+        
+        // [FIX] Detect if this is a Claude thinking model for the anthropic-beta header
+        let is_thinking_model = mapped_model.contains("-thinking") 
+            || mapped_model.contains("opus-4") 
+            || request.thinking.as_ref().map(|t| t.type_ == "enabled").unwrap_or(false);
 
-        let response = match upstream.call_v1_internal(method, &access_token, gemini_body, query).await {
+        let response = match upstream.call_v1_internal(method, &access_token, gemini_body, query, is_thinking_model).await {
             Ok(r) => r,
             Err(e) => {
                 last_error = e.clone();
-                debug!("[{}] Request failed: {}", trace_id, e);
+                
+                // [FIX] Parse status code from error message and mark account as rate-limited
+                // This ensures the next attempt will use a different account
+                let status_code = if e.contains("429") { 
+                    429u16 
+                } else if e.contains("503") { 
+                    503u16 
+                } else if e.contains("500") { 
+                    500u16 
+                } else { 
+                    502u16 
+                };
+                last_status = Some(status_code);
+                
+                // Mark account as rate limited so next get_token() returns a different account
+                if status_code == 429 || status_code == 503 || status_code == 500 {
+                    token_manager.mark_rate_limited(
+                        &email,  // account_id is the email
+                        status_code,
+                        None,    // No retry-after header available from error string
+                        &e,      // Error body for parsing
+                    );
+                    info!("[{}] Account {} marked as rate-limited (status {})", trace_id, email, status_code);
+                }
+                
+                // Retry logic for 429/500 - but DON'T sleep for 429 since we're switching accounts
+                if attempt + 1 < max_attempts {
+                    let delay_ms = match status_code {
+                        429 => 0,  // No delay for 429, just switch account immediately
+                        _ => apply_jitter(500 * (attempt as u64 + 1)),
+                    };
+                    
+                    if delay_ms > 0 {
+                        sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                }
                 continue;
             }
         };
         
-        let status = response.status();
-        
-        // 成功
-        if status.is_success() {
-            if request.stream {
-                let stream = response.bytes_stream();
-                let gemini_stream = Box::pin(stream);
-                let claude_stream = create_claude_sse_stream(gemini_stream, trace_id, email);
+        // Success
+        if request.stream {
+            let stream = response.bytes_stream();
+            let gemini_stream = Box::pin(stream);
+            let claude_stream = create_claude_sse_stream(gemini_stream, trace_id, email);
 
-                let sse_stream = claude_stream.map(|result| -> Result<Bytes, std::io::Error> {
-                    match result {
-                        Ok(bytes) => Ok(bytes),
-                        Err(e) => Ok(Bytes::from(format!("data: {{\"error\":\"{}\"}}\n\n", e))),
-                    }
-                });
+            let sse_stream = claude_stream.map(|result| -> Result<Bytes, std::io::Error> {
+                match result {
+                    Ok(bytes) => Ok(bytes),
+                    Err(e) => Ok(Bytes::from(format!("data: {{\"error\":\"{}\"}}\n\n", e))),
+                }
+            });
 
-                return Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "text/event-stream")
-                    .header(header::CACHE_CONTROL, "no-cache")
-                    .header(header::CONNECTION, "keep-alive")
-                    .body(Body::from_stream(sse_stream))
-                    .unwrap();
-            } else {
-                let bytes = match response.bytes().await {
-                    Ok(b) => b,
-                    Err(e) => return (StatusCode::BAD_GATEWAY, format!("Failed to read body: {}", e)).into_response(),
-                };
-
-                let gemini_resp: Value = match serde_json::from_slice(&bytes) {
-                    Ok(v) => v,
-                    Err(e) => return (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)).into_response(),
-                };
-
-                let raw = gemini_resp.get("response").unwrap_or(&gemini_resp);
-
-                let gemini_response: crate::proxy::mappers::claude::models::GeminiResponse = 
-                    match serde_json::from_value(raw.clone()) {
-                        Ok(r) => r,
-                        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Convert error: {}", e)).into_response(),
-                    };
-                
-                let claude_response = match transform_response(&gemini_response) {
-                    Ok(r) => r,
-                    Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Transform error: {}", e)).into_response(),
-                };
-
-                info!(
-                    "[{}] Completed | In: {} | Out: {}", 
-                    trace_id, 
-                    claude_response.usage.input_tokens, 
-                    claude_response.usage.output_tokens
-                );
-
-                return Json(claude_response).into_response();
-            }
-        }
-        
-        // 处理错误
-        let status_code = status.as_u16();
-        let error_text = response.text().await.unwrap_or_else(|_| format!("HTTP {}", status));
-        last_error = format!("HTTP {}: {}", status_code, error_text);
-        last_status = Some(status_code);
-        
-        debug!("[{}] Upstream error: {}", trace_id, last_error);
-        
-        // 重试逻辑
-        if attempt + 1 < max_attempts {
-            let delay_ms = match status_code {
-                429 => apply_jitter(1000 * (attempt as u64 + 1)),
-                503 | 529 | 500 => apply_jitter(500 * (attempt as u64 + 1)),
-                _ => 0,
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .header(header::CONNECTION, "keep-alive")
+                .body(Body::from_stream(sse_stream))
+                .unwrap();
+        } else {
+            let bytes = match response.bytes().await {
+                Ok(b) => b,
+                Err(e) => return (StatusCode::BAD_GATEWAY, format!("Failed to read body: {}", e)).into_response(),
             };
+
+            let gemini_resp: Value = match serde_json::from_slice(&bytes) {
+                Ok(v) => v,
+                Err(e) => return (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)).into_response(),
+            };
+
+            let raw = gemini_resp.get("response").unwrap_or(&gemini_resp);
+
+            let gemini_response: crate::proxy::mappers::claude::models::GeminiResponse = 
+                match serde_json::from_value(raw.clone()) {
+                    Ok(r) => r,
+                    Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Convert error: {}", e)).into_response(),
+                };
             
-            if delay_ms > 0 {
-                sleep(Duration::from_millis(delay_ms)).await;
-            }
+            let claude_response = match transform_response(&gemini_response) {
+                Ok(r) => r,
+                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Transform error: {}", e)).into_response(),
+            };
+
+            info!(
+                "[{}] Completed | In: {} | Out: {}", 
+                trace_id, 
+                claude_response.usage.input_tokens, 
+                claude_response.usage.output_tokens
+            );
+
+            return Json(claude_response).into_response();
         }
     }
     
     // 所有重试失败 - 保留原始状态码
     let response_status = match last_status {
         Some(429) => StatusCode::TOO_MANY_REQUESTS,
-        Some(code) if code >= 400 && code < 600 => {
-            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY)
-        }
         _ => StatusCode::BAD_GATEWAY,
     };
 

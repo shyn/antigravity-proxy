@@ -186,7 +186,7 @@ fn default_max_wait_seconds() -> u64 { 30 }
 fn default_accounts_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".antigravity_tools")
+        .join(".antigravity-proxy")
         .join("accounts")
 }
 

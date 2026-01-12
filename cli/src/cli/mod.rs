@@ -41,6 +41,9 @@ pub enum Commands {
         account: Option<String>,
     },
     
+    /// Login with Google account
+    Login,
+    
     /// Show proxy status
     Status,
     

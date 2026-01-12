@@ -28,6 +28,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Quota { all, account } => {
             cli::commands::quota::run(all, account).await?;
         }
+        Commands::Login => {
+            cli::commands::login::run().await?;
+        }
         Commands::Status => {
             cli::commands::status::run().await?;
         }

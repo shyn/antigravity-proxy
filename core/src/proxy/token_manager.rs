@@ -21,6 +21,8 @@ pub struct ProxyToken {
     pub account_path: PathBuf,
     pub project_id: Option<String>,
     pub subscription_tier: Option<String>,
+    /// Flag to force refresh on first use after loading (ensures fresh token after proxy restart)
+    pub needs_initial_refresh: bool,
 }
 
 pub struct TokenManager {
@@ -144,6 +146,7 @@ impl TokenManager {
             account_path: path.clone(),
             project_id,
             subscription_tier,
+            needs_initial_refresh: true, // Force refresh on first use
         }))
     }
     
@@ -264,21 +267,27 @@ impl TokenManager {
                 }
             };
             
-            // Check token expiry (refresh if < 5 minutes remaining)
+            // Check token expiry (refresh if < 5 minutes remaining OR needs_initial_refresh)
             let now = chrono::Utc::now().timestamp();
-            if now >= token.timestamp - 300 {
-                tracing::debug!("Token for {} expiring soon, refreshing...", token.email);
+            if token.needs_initial_refresh || now >= token.timestamp - 300 {
+                if token.needs_initial_refresh {
+                    tracing::info!("Initial token refresh for {} (first use after proxy start)", token.email);
+                } else {
+                    tracing::debug!("Token for {} expiring soon, refreshing...", token.email);
+                }
                 
                 match crate::oauth::refresh_access_token(&token.refresh_token).await {
                     Ok(response) => {
                         token.access_token = response.access_token.clone();
                         token.expires_in = response.expires_in;
                         token.timestamp = now + response.expires_in;
+                        token.needs_initial_refresh = false;
                         
                         if let Some(mut entry) = self.tokens.get_mut(&token.account_id) {
                             entry.access_token = token.access_token.clone();
                             entry.expires_in = token.expires_in;
                             entry.timestamp = token.timestamp;
+                            entry.needs_initial_refresh = false;
                         }
                         
                         // Save refreshed token to disk
