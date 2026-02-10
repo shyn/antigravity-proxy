@@ -2,10 +2,12 @@
 //! Handles /v1/chat/completions, /v1/completions, /v1/models, /v1/images/generations
 
 use axum::{
+    body::Body,
     extract::{Json, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
 };
+use futures::StreamExt;
 use serde_json::{json, Value};
 
 use crate::proxy::server::AppState;
@@ -99,9 +101,27 @@ pub async fn handle_chat_completions(
         
         // Success
         if stream {
-            // TODO: Implement SSE streaming conversion
-            let body_text = response.text().await.unwrap_or_default();
-            return Ok((StatusCode::OK, body_text).into_response());
+            // Convert Gemini SSE to OpenAI SSE format
+            let gemini_stream = Box::pin(response.bytes_stream());
+            let openai_stream = crate::proxy::mappers::openai::create_openai_sse_stream(
+                gemini_stream,
+                model.to_string(),
+            );
+            
+            // Convert to axum body
+            let body = Body::from_stream(openai_stream.map(|result| {
+                result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            }));
+            
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .header(header::CONNECTION, "keep-alive")
+                .body(body)
+                .unwrap();
+            
+            return Ok(response.into_response());
         } else {
             let raw_response: Value = response.json().await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Invalid JSON response: {}", e)))?;
