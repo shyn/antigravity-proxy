@@ -25,7 +25,7 @@ impl UpstreamClient {
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(60))
             .timeout(Duration::from_secs(600))
-            .user_agent("antigravity/1.11.5 windows/amd64");
+            .user_agent("antigravity/1.15.8 darwin/amd64");
         
         if let Some(proxy) = proxy_url {
             if !proxy.is_empty() {
@@ -80,7 +80,7 @@ impl UpstreamClient {
         // [FIX] Explicitly set all headers to match TypeScript ANTIGRAVITY_HEADERS exactly
         headers.insert(
             header::USER_AGENT,
-            header::HeaderValue::from_static("antigravity/1.11.5 windows/amd64"),
+            header::HeaderValue::from_static("antigravity/1.15.8 darwin/amd64"),
         );
         headers.insert(
             header::CONTENT_TYPE,
